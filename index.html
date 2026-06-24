@@ -518,11 +518,11 @@
     <div class="setup-icon">🔑</div>
     <div class="setup-title">设置 API Key</div>
     <div class="setup-desc">
-      输入你的 Anthropic API Key 开始使用。<br>
-      去 <a href="https://console.anthropic.com" target="_blank">console.anthropic.com</a> 申请<br>
+      输入你的 DeepSeek API Key 开始使用。<br>
+      去 <a href="https://platform.deepseek.com" target="_blank">platform.deepseek.com</a> 申请，支付宝即可充值<br>
       <span style="font-size:11px;opacity:0.7;">Key 只存在你手机里，不会上传到任何服务器</span>
     </div>
-    <input class="setup-input" id="apiKeyInput" type="password" placeholder="sk-ant-api03-..." autocomplete="off">
+    <input class="setup-input" id="apiKeyInput" type="password" placeholder="sk-..." autocomplete="off">
     <button class="setup-btn" id="saveKeyBtn">保存并开始</button>
     <div class="setup-hint">💡 也可以粘贴从其他来源获取的 Key</div>
   </div>
@@ -542,10 +542,8 @@
     <div class="form-group">
       <label class="form-label">模型</label>
       <select class="form-select" id="settingsModel">
-        <option value="claude-sonnet-4-6">Sonnet 4.6 — 平衡</option>
-        <option value="claude-fable-5">Fable 5 — 最新</option>
-        <option value="claude-opus-4-8">Opus 4.8 — 最强</option>
-        <option value="claude-haiku-4-5-20251001">Haiku 4.5 — 快速</option>
+        <option value="deepseek-chat">DeepSeek-V3 — 日常聊天</option>
+        <option value="deepseek-reasoner">DeepSeek-R1 — 深度推理</option>
       </select>
     </div>
 
@@ -583,7 +581,7 @@ const DEFAULT_SYSTEM = '你是 Claude，一个友好的 AI 助手。用中文回
 
 let state = {
   apiKey: '',
-  model: 'claude-sonnet-4-6',
+  model: 'deepseek-chat',
   system: DEFAULT_SYSTEM,
   maxTokens: 4096,
   messages: []   // { role, content }
@@ -802,22 +800,25 @@ async function sendMessage() {
   abortController = new AbortController();
 
   try {
+    // Build messages in OpenAI format
+    const apiMessages = [];
+    if (state.system && state.system.trim()) {
+      apiMessages.push({ role: 'system', content: state.system.trim() });
+    }
+    state.messages.forEach(m => apiMessages.push({ role: m.role, content: m.content }));
+
     const payload = {
       model: state.model,
       max_tokens: state.maxTokens,
       stream: true,
-      messages: state.messages.map(m => ({ role: m.role, content: m.content }))
+      messages: apiMessages
     };
-    if (state.system && state.system.trim()) {
-      payload.system = state.system.trim();
-    }
 
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    const resp = await fetch('https://api.deepseek.com/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': state.apiKey,
-        'anthropic-version': '2023-06-01'
+        'Authorization': `Bearer ${state.apiKey}`
       },
       body: JSON.stringify(payload),
       signal: abortController.signal
@@ -833,7 +834,7 @@ async function sendMessage() {
       throw new Error(errMsg);
     }
 
-    // Read SSE stream
+    // Read SSE stream (OpenAI-compatible format)
     if (!resp.body) throw new Error('浏览器不支持流式响应');
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
@@ -845,31 +846,23 @@ async function sendMessage() {
 
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
-      buffer = lines.pop() || '';  // keep incomplete line in buffer
+      buffer = lines.pop() || '';
 
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6);
-        if (data === '[DONE]') continue;
+        const data = line.slice(6).trim();
+        if (!data || data === '[DONE]') continue;
 
         try {
           const event = JSON.parse(data);
-
-          if (event.type === 'content_block_delta') {
-            const textDelta = event.delta?.text;
-            if (textDelta) {
-              currentRawText += textDelta;
-              currentAssistantMsg.innerHTML = renderMarkdown(currentRawText);
-              scrollToBottom();
-            }
-          } else if (event.type === 'message_stop') {
-            // Stream ended normally
-          } else if (event.type === 'error') {
-            throw new Error(event.error?.message || 'API 错误');
+          const delta = event.choices?.[0]?.delta?.content;
+          if (delta) {
+            currentRawText += delta;
+            currentAssistantMsg.innerHTML = renderMarkdown(currentRawText);
+            scrollToBottom();
           }
         } catch(e) {
-          if (e.message && !e.message.includes('Unexpected token')) throw e;
-          // Ignore JSON parse errors for malformed lines
+          // Skip malformed JSON lines
         }
       }
     }
