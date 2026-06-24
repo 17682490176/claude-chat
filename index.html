@@ -862,10 +862,14 @@ function renderAllMessages() {
 }
 
 function scrollToBottom() {
+  if (scrollPending) return;
+  scrollPending = true;
   requestAnimationFrame(() => {
     $messages.scrollTop = $messages.scrollHeight;
+    scrollPending = false;
   });
 }
+let scrollPending = false;
 
 // ============ Streaming ============
 function setStreaming(isStreaming) {
@@ -952,6 +956,28 @@ async function sendMessage() {
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let renderPending = false;
+    let lastRender = 0;
+    const RENDER_INTERVAL = 50; // ms — throttle DOM updates
+
+    function doRender() {
+      renderPending = false;
+      lastRender = performance.now();
+      currentAssistantMsg.innerHTML = renderMarkdown(currentRawText);
+      scrollToBottom();
+    }
+
+    function scheduleRender() {
+      if (renderPending) return;
+      const now = performance.now();
+      const elapsed = now - lastRender;
+      if (elapsed >= RENDER_INTERVAL) {
+        doRender();
+      } else {
+        renderPending = true;
+        setTimeout(() => doRender(), RENDER_INTERVAL - elapsed);
+      }
+    }
 
     while (true) {
       const { done, value } = await reader.read();
@@ -971,13 +997,17 @@ async function sendMessage() {
           const delta = event.choices?.[0]?.delta?.content;
           if (delta) {
             currentRawText += delta;
-            currentAssistantMsg.innerHTML = renderMarkdown(currentRawText);
-            scrollToBottom();
+            scheduleRender();
           }
         } catch(e) {
           // Skip malformed JSON lines
         }
       }
+    }
+
+    // Final render — flush whatever is left
+    if (renderPending || currentRawText.length > 0) {
+      doRender();
     }
 
     // Finalize
