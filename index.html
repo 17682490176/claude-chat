@@ -648,6 +648,19 @@
     <div class="modal-title">⚙️ 设置</div>
 
     <div class="form-group">
+      <label class="form-label">API 来源</label>
+      <select class="form-select" id="settingsProvider">
+        <option value="deepseek">DeepSeek — 国内直连</option>
+        <option value="anthropic">Anthropic (Claude) — 需代理</option>
+      </select>
+    </div>
+
+    <div class="form-group" id="proxyUrlGroup" style="display:none;">
+      <label class="form-label">代理地址 (Cloudflare Worker)</label>
+      <input class="form-input" id="settingsProxyUrl" type="text" placeholder="https://你的worker.workers.dev">
+    </div>
+
+    <div class="form-group">
       <label class="form-label">API Key</label>
       <input class="form-input" id="settingsApiKey" type="password" placeholder="sk-...">
     </div>
@@ -655,8 +668,6 @@
     <div class="form-group">
       <label class="form-label">模型</label>
       <select class="form-select" id="settingsModel">
-        <option value="deepseek-chat">DeepSeek-V3 — 日常聊天</option>
-        <option value="deepseek-reasoner">DeepSeek-R1 — 深度推理</option>
       </select>
     </div>
 
@@ -694,11 +705,24 @@ const DEFAULT_SYSTEM = '你是 DeepSeek，一个友好的 AI 助手。用中文�
 
 let state = {
   apiKey: '',
+  provider: 'deepseek',      // 'anthropic' | 'deepseek'
+  proxyUrl: '',               // Cloudflare Worker URL (for anthropic)
   model: 'deepseek-chat',
   system: DEFAULT_SYSTEM,
   maxTokens: 4096,
-  messages: []   // { role, content }
+  messages: []
 };
+
+const ANTHROPIC_MODELS = [
+  { id: 'claude-fable-5', name: 'Fable 5 — 最新' },
+  { id: 'claude-opus-4-8', name: 'Opus 4.8 — 最强' },
+  { id: 'claude-sonnet-4-6', name: 'Sonnet 4.6 — 平衡' },
+  { id: 'claude-haiku-4-5-20251001', name: 'Haiku 4.5 — 快速' },
+];
+const DEEPSEEK_MODELS = [
+  { id: 'deepseek-chat', name: 'DeepSeek-V3 — 日常聊天' },
+  { id: 'deepseek-reasoner', name: 'DeepSeek-R1 — 深度推理' },
+];
 
 let abortController = null;
 let currentAssistantMsg = null;  // DOM element being streamed into
@@ -721,7 +745,9 @@ function loadState() {
     const saved = JSON.parse(localStorage.getItem('claude_chat_state'));
     if (saved) {
       state.apiKey = saved.apiKey || '';
-      state.model = saved.model || 'deepseek-chat';
+      state.provider = saved.provider || 'deepseek';
+      state.proxyUrl = saved.proxyUrl || '';
+      state.model = saved.model || (saved.provider === 'anthropic' ? 'claude-sonnet-4-6' : 'deepseek-chat');
       state.system = saved.system || DEFAULT_SYSTEM;
       state.maxTokens = saved.maxTokens || 4096;
       state.messages = saved.messages || [];
@@ -733,6 +759,8 @@ function saveState() {
   try {
     localStorage.setItem('claude_chat_state', JSON.stringify({
       apiKey: state.apiKey,
+      provider: state.provider,
+      proxyUrl: state.proxyUrl,
       model: state.model,
       system: state.system,
       maxTokens: state.maxTokens,
@@ -917,26 +945,50 @@ async function sendMessage() {
   abortController = new AbortController();
 
   try {
-    // Build messages in OpenAI format
-    const apiMessages = [];
-    if (state.system && state.system.trim()) {
-      apiMessages.push({ role: 'system', content: state.system.trim() });
-    }
-    state.messages.forEach(m => apiMessages.push({ role: m.role, content: m.content }));
+    // ===== Build request based on provider =====
+    const isAnthropic = state.provider === 'anthropic';
+    let endpoint, headers, payload;
 
-    const payload = {
-      model: state.model,
-      max_tokens: state.maxTokens,
-      stream: true,
-      messages: apiMessages
-    };
-
-    const resp = await fetch('https://api.deepseek.com/chat/completions', {
-      method: 'POST',
-      headers: {
+    if (isAnthropic) {
+      // Anthropic API format
+      endpoint = state.proxyUrl || 'https://api.anthropic.com/v1/messages';
+      headers = {
+        'Content-Type': 'application/json',
+        'x-api-key': state.apiKey,
+        'anthropic-version': '2023-06-01'
+      };
+      payload = {
+        model: state.model,
+        max_tokens: state.maxTokens,
+        stream: true,
+        messages: state.messages.map(m => ({ role: m.role, content: m.content }))
+      };
+      if (state.system && state.system.trim()) {
+        payload.system = state.system.trim();
+      }
+    } else {
+      // DeepSeek (OpenAI-compatible) format
+      endpoint = 'https://api.deepseek.com/chat/completions';
+      headers = {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${state.apiKey}`
-      },
+      };
+      const apiMessages = [];
+      if (state.system && state.system.trim()) {
+        apiMessages.push({ role: 'system', content: state.system.trim() });
+      }
+      state.messages.forEach(m => apiMessages.push({ role: m.role, content: m.content }));
+      payload = {
+        model: state.model,
+        max_tokens: state.maxTokens,
+        stream: true,
+        messages: apiMessages
+      };
+    }
+
+    const resp = await fetch(endpoint, {
+      method: 'POST',
+      headers,
       body: JSON.stringify(payload),
       signal: abortController.signal
     });
@@ -988,19 +1040,45 @@ async function sendMessage() {
       buffer = lines.pop() || '';
 
       for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
+        // Handle Anthropic SSE events (have "event:" prefix)
+        let eventName = '';
+        let data = '';
+        if (line.startsWith('event: ')) {
+          eventName = line.slice(7).trim();
+          continue;
+        }
+        if (line.startsWith('data: ')) {
+          data = line.slice(6).trim();
+        } else {
+          continue;
+        }
         if (!data || data === '[DONE]') continue;
 
         try {
           const event = JSON.parse(data);
-          const delta = event.choices?.[0]?.delta?.content;
-          if (delta) {
-            currentRawText += delta;
-            scheduleRender();
+
+          if (isAnthropic) {
+            // Anthropic SSE: content_block_delta events
+            if (event.type === 'content_block_delta') {
+              const textDelta = event.delta?.text;
+              if (textDelta) {
+                currentRawText += textDelta;
+                scheduleRender();
+              }
+            } else if (event.type === 'error') {
+              throw new Error(event.error?.message || 'API 错误');
+            }
+          } else {
+            // DeepSeek (OpenAI) SSE
+            const delta = event.choices?.[0]?.delta?.content;
+            if (delta) {
+              currentRawText += delta;
+              scheduleRender();
+            }
           }
         } catch(e) {
-          // Skip malformed JSON lines
+          if (e.message && !e.message.includes('position')) throw e;
+          // Skip malformed JSON lines (Anthropic SSE can have non-JSON events)
         }
       }
     }
@@ -1053,11 +1131,28 @@ function showToast(msg, type = 'info') {
 }
 
 // ============ Settings Modal ============
+function populateModelSelect(provider) {
+  const sel = document.getElementById('settingsModel');
+  sel.innerHTML = '';
+  const models = provider === 'anthropic' ? ANTHROPIC_MODELS : DEEPSEEK_MODELS;
+  models.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = m.id;
+    opt.textContent = m.name;
+    sel.appendChild(opt);
+  });
+}
+
 function openSettings() {
+  document.getElementById('settingsProvider').value = state.provider;
+  document.getElementById('settingsProxyUrl').value = state.proxyUrl;
   document.getElementById('settingsApiKey').value = state.apiKey;
+  populateModelSelect(state.provider);
   document.getElementById('settingsModel').value = state.model;
   document.getElementById('settingsSystem').value = state.system;
   document.getElementById('settingsMaxTokens').value = String(state.maxTokens);
+  // Show/hide proxy URL based on provider
+  document.getElementById('proxyUrlGroup').style.display = state.provider === 'anthropic' ? '' : 'none';
   $settingsModal.classList.add('active');
 }
 
@@ -1066,6 +1161,8 @@ function closeSettings() {
 }
 
 function saveSettings() {
+  state.provider = document.getElementById('settingsProvider').value;
+  state.proxyUrl = document.getElementById('settingsProxyUrl').value.trim();
   state.apiKey = document.getElementById('settingsApiKey').value.trim();
   state.model = document.getElementById('settingsModel').value;
   state.system = document.getElementById('settingsSystem').value.trim();
@@ -1073,7 +1170,17 @@ function saveSettings() {
   saveState();
   closeSettings();
   showToast('设置已保存 ✓', 'info');
+  // Update header title
+  updateHeaderTitle();
   checkSetup();
+}
+
+function updateHeaderTitle() {
+  const title = document.querySelector('#chatScreen .header-title');
+  if (title) {
+    const providerName = state.provider === 'anthropic' ? 'Claude' : 'DeepSeek';
+    title.innerHTML = `<div class="logo-icon">🤖</div> ${providerName} <span class="dot"></span>`;
+  }
 }
 
 function clearAllChats() {
@@ -1144,6 +1251,18 @@ document.getElementById('saveSettingsBtn').addEventListener('click', saveSetting
 document.getElementById('closeSettingsBtn').addEventListener('click', closeSettings);
 document.getElementById('clearChatBtn').addEventListener('click', clearAllChats);
 document.getElementById('btnNewChat').addEventListener('click', newChat);
+
+// Provider切换 → 更新模型列表 + 显示/隐藏代理地址
+document.getElementById('settingsProvider').addEventListener('change', function() {
+  const prov = this.value;
+  populateModelSelect(prov);
+  document.getElementById('proxyUrlGroup').style.display = prov === 'anthropic' ? '' : 'none';
+  // Auto-select first model for provider
+  const models = prov === 'anthropic' ? ANTHROPIC_MODELS : DEEPSEEK_MODELS;
+  document.getElementById('settingsModel').value = models[0].id;
+  // Update API key placeholder
+  document.getElementById('settingsApiKey').placeholder = prov === 'anthropic' ? 'sk-ant-api03-...' : 'sk-...';
+});
 
 // ============ Keyboard Shortcut ============
 document.addEventListener('keydown', (e) => {
